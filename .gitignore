@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual Environment
+venv/
+.env/
+
+# Environment variables (VERY IMPORTANT)
+.env
+
+# VS Code
+.vscode/
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Azure / build
+*.zip
+*.tar
+*.gz
+
+# Databases / temp
+*.sqlite3
+*.db
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Secrets (CRITICAL)
+secrets.json
+config.json
