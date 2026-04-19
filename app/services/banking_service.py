@@ -279,3 +279,86 @@ def get_financial_insights(query: str) -> Dict:
             "top_expenses": [],
             "category_spend": [],
         }
+    
+    # ======================================================
+# MAIN QUERY HANDLER (THIS WAS MISSING)
+# ======================================================
+def handle_query(query: str) -> str:
+    try:
+        q = query.lower()
+
+        # ------------------------------------------------
+        # TRANSACTION TYPES WITH COUNT
+        # ------------------------------------------------
+        if "transaction type" in q and "count" in q:
+            data = get_all_tran_types_with_count()
+            if not data:
+                return "No transaction data found"
+
+            return "\n".join([f"{t}: {c}" for t, c in data])
+
+        # ------------------------------------------------
+        # TRANSACTION TYPES
+        # ------------------------------------------------
+        if "transaction type" in q:
+            data = get_all_tran_types()
+            if not data:
+                return "No transaction types found"
+
+            return ", ".join(data)
+
+        # ------------------------------------------------
+        # SPENDING BY CATEGORY
+        # ------------------------------------------------
+        if "spending" in q or "category" in q:
+            data = get_spending_by_category(query)
+            if not data:
+                return "No spending data found"
+
+            return "\n".join([f"{cat}: ₹{amt:,.2f}" for cat, amt in data])
+
+        # ------------------------------------------------
+        # TOP EXPENSES
+        # ------------------------------------------------
+        if "top expense" in q or "highest expense" in q:
+            data = get_top_expenses(query)
+            if not data:
+                return "No expense data found"
+
+            return "\n".join([
+                f"{d.get('date')} | {d.get('description')} | ₹{abs(float(d.get('amount', 0))):,.2f}"
+                for d in data[:10]
+            ])
+
+        # ------------------------------------------------
+        # INSIGHTS
+        # ------------------------------------------------
+        if "insight" in q or "analysis" in q:
+            data = get_financial_insights(query)
+
+            return (
+                f"Total Spend: ₹{data['total_spend']:,.2f}\n"
+                f"Top Category: {data['top_category']}\n\n"
+                f"Top Expenses:\n" +
+                "\n".join([
+                    f"{e.get('description')} - ₹{abs(float(e.get('amount', 0))):,.2f}"
+                    for e in data["top_expenses"]
+                ])
+            )
+
+        # ------------------------------------------------
+        # DEFAULT → SEARCH TRANSACTIONS
+        # ------------------------------------------------
+        data = search_transactions(query)
+
+        if not data:
+            return "No transactions found"
+
+        return "\n".join([
+            f"{d.get('date')} | {d.get('description')} | {d.get('tran_type')} | ₹{float(d.get('amount', 0)):,.2f}"
+            for d in data[:10]
+        ])
+
+    except Exception as e:
+        logger.exception("handle_query error")
+        return f"Error processing request: {str(e)}"
