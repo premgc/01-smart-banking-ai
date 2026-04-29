@@ -3,7 +3,8 @@ from __future__ import annotations
 import os
 import logging
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
+from functools import lru_cache
 
 from dotenv import load_dotenv
 from openai import AzureOpenAI
@@ -23,18 +24,11 @@ load_dotenv(dotenv_path=env_path)
 # =========================================================
 # ENV CONFIG
 # =========================================================
-
-# Azure OpenAI embedding config
 AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "").strip()
 AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY", "").strip()
 AZURE_OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-01").strip()
+AZURE_OPENAI_EMBEDDING_DEPLOYMENT = os.getenv("AZURE_OPENAI_EMBEDDING_DEPLOYMENT", "").strip()
 
-AZURE_OPENAI_EMBEDDING_DEPLOYMENT = os.getenv(
-    "AZURE_OPENAI_EMBEDDING_DEPLOYMENT",
-    ""
-).strip()
-
-# Databricks Vector Search config
 DATABRICKS_HOST = os.getenv("DATABRICKS_HOST", "").strip()
 DATABRICKS_TOKEN = os.getenv("DATABRICKS_TOKEN", "").strip()
 
@@ -50,7 +44,6 @@ VECTOR_SEARCH_INDEX = os.getenv(
 
 DEFAULT_LIMIT = int(os.getenv("VECTOR_SEARCH_TOP_K", "5"))
 
-# Columns to return from Databricks Vector Search
 RETURN_COLUMNS = [
     "transaction_key",
     "content",
@@ -67,41 +60,34 @@ RETURN_COLUMNS = [
     "source_file",
 ]
 
-
 # =========================================================
 # VALIDATION
 # =========================================================
 def validate_config() -> None:
     missing = []
 
-    if not AZURE_OPENAI_ENDPOINT:
-        missing.append("AZURE_OPENAI_ENDPOINT")
+    required = {
+        "AZURE_OPENAI_ENDPOINT": AZURE_OPENAI_ENDPOINT,
+        "AZURE_OPENAI_API_KEY": AZURE_OPENAI_API_KEY,
+        "AZURE_OPENAI_EMBEDDING_DEPLOYMENT": AZURE_OPENAI_EMBEDDING_DEPLOYMENT,
+        "DATABRICKS_HOST": DATABRICKS_HOST,
+        "DATABRICKS_TOKEN": DATABRICKS_TOKEN,
+        "DATABRICKS_VECTOR_SEARCH_ENDPOINT": VECTOR_SEARCH_ENDPOINT,
+        "DATABRICKS_VECTOR_SEARCH_INDEX": VECTOR_SEARCH_INDEX,
+    }
 
-    if not AZURE_OPENAI_API_KEY:
-        missing.append("AZURE_OPENAI_API_KEY")
-
-    if not AZURE_OPENAI_EMBEDDING_DEPLOYMENT:
-        missing.append("AZURE_OPENAI_EMBEDDING_DEPLOYMENT")
-
-    if not DATABRICKS_HOST:
-        missing.append("DATABRICKS_HOST")
-
-    if not DATABRICKS_TOKEN:
-        missing.append("DATABRICKS_TOKEN")
-
-    if not VECTOR_SEARCH_ENDPOINT:
-        missing.append("DATABRICKS_VECTOR_SEARCH_ENDPOINT")
-
-    if not VECTOR_SEARCH_INDEX:
-        missing.append("DATABRICKS_VECTOR_SEARCH_INDEX")
+    for key, value in required.items():
+        if not value:
+            missing.append(key)
 
     if missing:
         raise RuntimeError(f"Missing configuration: {', '.join(missing)}")
 
 
 # =========================================================
-# CLIENTS
+# OPENAI CLIENT
 # =========================================================
+@lru_cache(maxsize=1)
 def get_openai_client() -> AzureOpenAI:
     validate_config()
 
@@ -112,16 +98,38 @@ def get_openai_client() -> AzureOpenAI:
     )
 
 
+# =========================================================
+# VECTOR SEARCH CLIENT
+# =========================================================
+@lru_cache(maxsize=1)
 def get_vector_search_client() -> VectorSearchClient:
+    """
+    Supports both old and new Databricks Vector Search SDK versions.
+    """
     validate_config()
 
-    return VectorSearchClient(
-        workspace_url=DATABRICKS_HOST,
-        personal_access_token=DATABRICKS_TOKEN,
-        disable_notice=True,
-    )
+    try:
+        logger.info("Initializing VectorSearchClient using explicit constructor auth")
+
+        return VectorSearchClient(
+            workspace_url=DATABRICKS_HOST,
+            personal_access_token=DATABRICKS_TOKEN,
+            disable_notice=True,
+        )
+
+    except TypeError:
+        logger.warning(
+            "Older Databricks Vector Search SDK detected. "
+            "Falling back to environment-based auth."
+        )
+
+        os.environ["DATABRICKS_HOST"] = DATABRICKS_HOST
+        os.environ["DATABRICKS_TOKEN"] = DATABRICKS_TOKEN
+
+        return VectorSearchClient()
 
 
+@lru_cache(maxsize=1)
 def get_vector_index():
     client = get_vector_search_client()
 
@@ -132,7 +140,7 @@ def get_vector_index():
 
 
 # =========================================================
-# EMBEDDING
+# EMBEDDINGS
 # =========================================================
 def get_embedding(text: str) -> List[float]:
     if not text or not text.strip():
@@ -155,7 +163,7 @@ def health_check() -> tuple[bool, str]:
     try:
         index = get_vector_index()
 
-        result = index.similarity_search(
+        index.similarity_search(
             query_vector=get_embedding("health check"),
             columns=["content"],
             num_results=1,
@@ -169,45 +177,30 @@ def health_check() -> tuple[bool, str]:
 
 
 # =========================================================
-# SEARCH DATBRICKS VECTOR INDEX
+# RAW SEARCH
 # =========================================================
 def search_raw(query: str, limit: int = DEFAULT_LIMIT) -> Dict[str, Any]:
-    """
-    Returns raw Databricks Vector Search response.
-    Useful for debugging.
-    """
     if not query or not query.strip():
         return {"result": {"data_array": []}}
 
     index = get_vector_index()
     query_vector = get_embedding(query)
 
-    results = index.similarity_search(
+    return index.similarity_search(
         query_vector=query_vector,
         columns=RETURN_COLUMNS,
         num_results=limit,
     )
 
-    return results
 
-
+# =========================================================
+# MAIN SEARCH
+# =========================================================
 def search(query: str, limit: int = DEFAULT_LIMIT) -> List[str]:
-    """
-    Main function used by the rest of your app.
-
-    Keeps the old contract:
-        search(query) -> List[str]
-
-    So banking_service.py / routes should not break.
-    """
     try:
         raw_results = search_raw(query=query, limit=limit)
 
-        data_array = (
-            raw_results
-            .get("result", {})
-            .get("data_array", [])
-        )
+        data_array = raw_results.get("result", {}).get("data_array", [])
 
         if not data_array:
             return []
@@ -215,17 +208,17 @@ def search(query: str, limit: int = DEFAULT_LIMIT) -> List[str]:
         columns = raw_results.get("manifest", {}).get("columns", [])
         column_names = [col.get("name") for col in columns]
 
-        content_index = column_names.index("content") if "content" in column_names else None
+        if "content" not in column_names:
+            logger.warning("Content column missing in vector search results")
+            return []
 
-        contents = []
+        content_index = column_names.index("content")
 
-        for row in data_array:
-            if content_index is not None and len(row) > content_index:
-                content = row[content_index]
-                if content:
-                    contents.append(str(content))
-
-        return contents
+        return [
+            str(row[content_index])
+            for row in data_array
+            if len(row) > content_index and row[content_index]
+        ]
 
     except Exception as e:
         logger.exception("Vector search failed")
@@ -233,20 +226,9 @@ def search(query: str, limit: int = DEFAULT_LIMIT) -> List[str]:
 
 
 # =========================================================
-# UPSERT PLACEHOLDER
+# UPSERT DISABLED
 # =========================================================
 def upsert_texts(texts: List[str]) -> int:
-    """
-    Databricks Vector Search is now backed by your Delta table.
-
-    Do not upload documents directly here like Azure AI Search.
-
-    Data should be inserted/merged into:
-        bronze.banking.statementpdf_transactions_vector
-
-    Then sync the Vector Search index.
-    """
     raise NotImplementedError(
-        "Direct upsert is disabled. "
-        "Load data into the Delta table, then sync the Databricks Vector Search index."
+        "Direct upsert disabled. Load data into Delta table and sync index."
     )
