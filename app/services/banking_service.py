@@ -1,35 +1,79 @@
+from __future__ import annotations
+
 import os
 import logging
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 from datetime import datetime, timedelta
 
-from azure.search.documents import SearchClient
-from azure.core.credentials import AzureKeyCredential
+from databricks import sql
+
+from app.retriever import search_raw
 
 logger = logging.getLogger(__name__)
 
 
-def _get_search_client() -> SearchClient:
-    endpoint = os.getenv("AZURE_SEARCH_ENDPOINT", "").strip()
-    index_name = os.getenv("AZURE_SEARCH_INDEX", "").strip()
-    api_key = os.getenv("AZURE_SEARCH_KEY", "").strip()
+# ======================================================
+# ENV CONFIG
+# ======================================================
+DATABRICKS_HOST = os.getenv("DATABRICKS_HOST", "").strip()
+DATABRICKS_TOKEN = os.getenv("DATABRICKS_TOKEN", "").strip()
+DATABRICKS_SQL_HTTP_PATH = os.getenv("DATABRICKS_SQL_HTTP_PATH", "").strip()
 
+DATABRICKS_TABLE = os.getenv(
+    "DATABRICKS_TRANSACTION_TABLE",
+    "bronze.banking.statementpdf_transactions_vector"
+).strip()
+
+
+# ======================================================
+# CONFIG HELPERS
+# ======================================================
+def _server_hostname() -> str:
+    return (
+        DATABRICKS_HOST
+        .replace("https://", "")
+        .replace("http://", "")
+        .rstrip("/")
+    )
+
+
+def _validate_sql_config() -> None:
     missing = []
-    if not endpoint:
-        missing.append("AZURE_SEARCH_ENDPOINT")
-    if not index_name:
-        missing.append("AZURE_SEARCH_INDEX")
-    if not api_key:
-        missing.append("AZURE_SEARCH_KEY")
+
+    if not DATABRICKS_HOST:
+        missing.append("DATABRICKS_HOST")
+    if not DATABRICKS_TOKEN:
+        missing.append("DATABRICKS_TOKEN")
+    if not DATABRICKS_SQL_HTTP_PATH:
+        missing.append("DATABRICKS_SQL_HTTP_PATH")
 
     if missing:
-        raise RuntimeError(f"Missing Azure Search config: {', '.join(missing)}")
+        raise RuntimeError(f"Missing Databricks SQL config: {', '.join(missing)}")
 
-    return SearchClient(
-        endpoint=endpoint,
-        index_name=index_name,
-        credential=AzureKeyCredential(api_key),
+
+def _get_sql_connection():
+    _validate_sql_config()
+
+    return sql.connect(
+        server_hostname=_server_hostname(),
+        http_path=DATABRICKS_SQL_HTTP_PATH,
+        access_token=DATABRICKS_TOKEN,
     )
+
+
+def _run_sql(query: str, params: Optional[Dict[str, Any]] = None) -> List[Dict]:
+    try:
+        with _get_sql_connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(query, params or {})
+                columns = [c[0] for c in cursor.description]
+                rows = cursor.fetchall()
+
+        return [dict(zip(columns, row)) for row in rows]
+
+    except Exception:
+        logger.exception("Databricks SQL execution failed")
+        return []
 
 
 # ======================================================
@@ -54,206 +98,170 @@ def _extract_tran_type_from_query(query: str) -> Optional[str]:
     return None
 
 
-def _extract_date_filter(query: str) -> Optional[str]:
+def _extract_start_date(query: str) -> Optional[str]:
     q = query.lower()
     today = datetime.today().date()
 
     if "last 7 days" in q or "last seven days" in q:
-        start = today - timedelta(days=7)
-        return f"date ge '{start.isoformat()}'"
+        return (today - timedelta(days=7)).isoformat()
 
     if "last 30 days" in q or "last thirty days" in q:
-        start = today - timedelta(days=30)
-        return f"date ge '{start.isoformat()}'"
+        return (today - timedelta(days=30)).isoformat()
 
     if "this month" in q:
-        start = today.replace(day=1)
-        return f"date ge '{start.isoformat()}'"
+        return today.replace(day=1).isoformat()
 
     return None
 
 
-def _combine_filters(filters: List[str]) -> Optional[str]:
-    clean = [f for f in filters if f]
-    if not clean:
-        return None
-    return " and ".join(clean)
+def _where_clause(query: str, debit_only: bool = False) -> Tuple[str, Dict[str, Any]]:
+    clauses = []
+    params: Dict[str, Any] = {}
+
+    tran_type = _extract_tran_type_from_query(query)
+    start_date = _extract_start_date(query)
+
+    if tran_type:
+        clauses.append("upper(tran_type) = :tran_type")
+        params["tran_type"] = tran_type
+
+    if start_date:
+        clauses.append("to_date(transaction_date) >= to_date(:start_date)")
+        params["start_date"] = start_date
+
+    if debit_only:
+        clauses.append("lower(type) = 'debit'")
+
+    if not clauses:
+        return "", params
+
+    return "WHERE " + " AND ".join(clauses), params
+
+
+def _safe_float(value: Any) -> float:
+    try:
+        return float(value or 0)
+    except Exception:
+        return 0.0
 
 
 # ======================================================
 # TRANSACTION TYPES
 # ======================================================
 def get_all_tran_types() -> List[str]:
-    try:
-        client = _get_search_client()
+    query = f"""
+        SELECT DISTINCT tran_type
+        FROM {DATABRICKS_TABLE}
+        WHERE tran_type IS NOT NULL
+        ORDER BY tran_type
+    """
 
-        results = client.search(
-            search_text="*",
-            facets=["tran_type,count:20"],
-            top=0,
-        )
-
-        facets = results.get_facets()
-        if not facets or "tran_type" not in facets:
-            return []
-
-        values = []
-        for item in facets["tran_type"]:
-            value = item.get("value")
-            if value:
-                values.append(str(value).strip())
-
-        return sorted(set(values))
-
-    except Exception:
-        logger.exception("Error fetching transaction types")
-        return []
+    rows = _run_sql(query)
+    return [str(r["tran_type"]).strip() for r in rows if r.get("tran_type")]
 
 
 def get_all_tran_types_with_count() -> List[Tuple[str, int]]:
-    try:
-        client = _get_search_client()
+    query = f"""
+        SELECT tran_type, COUNT(*) AS txn_count
+        FROM {DATABRICKS_TABLE}
+        WHERE tran_type IS NOT NULL
+        GROUP BY tran_type
+        ORDER BY txn_count DESC, tran_type
+    """
 
-        results = client.search(
-            search_text="*",
-            facets=["tran_type,count:20"],
-            top=0,
-        )
-
-        facets = results.get_facets()
-        if not facets or "tran_type" not in facets:
-            return []
-
-        values: List[Tuple[str, int]] = []
-        for item in facets["tran_type"]:
-            value = item.get("value")
-            count = item.get("count", 0)
-            if value:
-                values.append((str(value).strip(), int(count)))
-
-        return sorted(values, key=lambda x: (-x[1], x[0]))
-
-    except Exception:
-        logger.exception("Error fetching transaction types with count")
-        return []
+    rows = _run_sql(query)
+    return [
+        (str(r["tran_type"]).strip(), int(r["txn_count"]))
+        for r in rows
+        if r.get("tran_type")
+    ]
 
 
 # ======================================================
-# SEARCH TRANSACTIONS
+# VECTOR SEARCH TRANSACTIONS
 # ======================================================
 def search_transactions(query: str) -> List[Dict]:
+    """
+    Semantic transaction search using Databricks Vector Search.
+    """
     try:
-        client = _get_search_client()
+        raw = search_raw(query=query, limit=20)
 
-        tran_type = _extract_tran_type_from_query(query)
-        date_filter = _extract_date_filter(query)
+        data_array = raw.get("result", {}).get("data_array", [])
+        columns = raw.get("manifest", {}).get("columns", [])
+        column_names = [c.get("name") for c in columns]
 
-        filters = []
-        if tran_type:
-            filters.append(f"tran_type eq '{tran_type}'")
-        if date_filter:
-            filters.append(date_filter)
+        results: List[Dict] = []
 
-        filter_query = _combine_filters(filters)
+        for row in data_array:
+            item = dict(zip(column_names, row))
 
-        results = client.search(
-            search_text="*",
-            filter=filter_query,
-            top=20,
-            select=[
-                "date",
-                "description",
-                "tran_type",
-                "amount",
-                "type",
-                "category",
-            ],
-            order_by=["date desc"]
-        )
+            results.append({
+                "date": item.get("transaction_date") or item.get("date"),
+                "description": item.get("description"),
+                "tran_type": item.get("tran_type"),
+                "amount": item.get("amount"),
+                "type": item.get("type"),
+                "category": item.get("category"),
+                "content": item.get("content"),
+            })
 
-        return [dict(r) for r in results]
+        return results
 
     except Exception:
-        logger.exception("Search error")
+        logger.exception("Databricks Vector Search transaction search failed")
         return []
 
 
-# ======================================================
-# HYBRID / VECTOR-READY SEARCH
-# ======================================================
 def search_transactions_hybrid(query: str) -> List[Dict]:
-    """
-    Placeholder hybrid search path.
-    Right now it falls back to structured search.
-    Later you can plug embeddings/vector query here.
-    """
-    try:
-        return search_transactions(query)
-    except Exception:
-        logger.exception("Hybrid search error")
-        return []
+    return search_transactions(query)
 
 
 # ======================================================
 # CATEGORY SPEND
 # ======================================================
 def get_spending_by_category(query: str) -> List[Tuple[str, float]]:
-    try:
-        client = _get_search_client()
+    where_sql, params = _where_clause(query, debit_only=True)
 
-        date_filter = _extract_date_filter(query)
-        type_filter = "type eq 'debit'"
+    sql_query = f"""
+        SELECT
+            COALESCE(category, 'other') AS category,
+            SUM(ABS(COALESCE(amount, 0))) AS total_spend
+        FROM {DATABRICKS_TABLE}
+        {where_sql}
+        GROUP BY COALESCE(category, 'other')
+        ORDER BY total_spend DESC
+    """
 
-        filter_query = _combine_filters([type_filter, date_filter])
+    rows = _run_sql(sql_query, params)
 
-        results = client.search(
-            search_text="*",
-            filter=filter_query,
-            top=1000,
-            select=["category", "amount", "type"]
-        )
-
-        totals: Dict[str, float] = {}
-
-        for r in results:
-            category = (r.get("category") or "other").strip()
-            amount = float(r.get("amount") or 0)
-
-            # debit amounts may be negative from ingestion
-            spend = abs(amount)
-            totals[category] = totals.get(category, 0.0) + spend
-
-        return sorted(totals.items(), key=lambda x: x[1], reverse=True)
-
-    except Exception:
-        logger.exception("Error getting spending by category")
-        return []
+    return [
+        (str(r["category"]), _safe_float(r["total_spend"]))
+        for r in rows
+    ]
 
 
 # ======================================================
-# TOP LOSSES / INSIGHTS
+# TOP EXPENSES / INSIGHTS
 # ======================================================
 def get_top_expenses(query: str) -> List[Dict]:
-    try:
-        client = _get_search_client()
+    where_sql, params = _where_clause(query, debit_only=True)
 
-        date_filter = _extract_date_filter(query)
-        type_filter = "type eq 'debit'"
-        filter_query = _combine_filters([type_filter, date_filter])
+    sql_query = f"""
+        SELECT
+            transaction_date AS date,
+            description,
+            tran_type,
+            amount,
+            category,
+            type
+        FROM {DATABRICKS_TABLE}
+        {where_sql}
+        ORDER BY ABS(COALESCE(amount, 0)) DESC
+        LIMIT 20
+    """
 
-        results = client.search(
-            search_text="*",
-            filter=filter_query,
-            top=20,
-            select=["date", "description", "tran_type", "amount", "category", "type"],
-            order_by=["amount asc"]  # most negative first
-        )
-
-        return [dict(r) for r in results]
-
-    except Exception:
-        logger.exception("Error getting top expenses")
-        return []
+    return _run_sql(sql_query, params)
 
 
 def get_financial_insights(query: str) -> Dict:
@@ -279,17 +287,18 @@ def get_financial_insights(query: str) -> Dict:
             "top_expenses": [],
             "category_spend": [],
         }
-    
-    # ======================================================
-# MAIN QUERY HANDLER (THIS WAS MISSING)
+
+
+# ======================================================
+# MAIN QUERY HANDLER
 # ======================================================
 def handle_query(query: str) -> str:
     try:
+        if not query or not query.strip():
+            return "Please enter a valid banking question."
+
         q = query.lower()
 
-        # ------------------------------------------------
-        # TRANSACTION TYPES WITH COUNT
-        # ------------------------------------------------
         if "transaction type" in q and "count" in q:
             data = get_all_tran_types_with_count()
             if not data:
@@ -297,9 +306,6 @@ def handle_query(query: str) -> str:
 
             return "\n".join([f"{t}: {c}" for t, c in data])
 
-        # ------------------------------------------------
-        # TRANSACTION TYPES
-        # ------------------------------------------------
         if "transaction type" in q:
             data = get_all_tran_types()
             if not data:
@@ -307,9 +313,6 @@ def handle_query(query: str) -> str:
 
             return ", ".join(data)
 
-        # ------------------------------------------------
-        # SPENDING BY CATEGORY
-        # ------------------------------------------------
         if "spending" in q or "category" in q:
             data = get_spending_by_category(query)
             if not data:
@@ -317,45 +320,44 @@ def handle_query(query: str) -> str:
 
             return "\n".join([f"{cat}: ₹{amt:,.2f}" for cat, amt in data])
 
-        # ------------------------------------------------
-        # TOP EXPENSES
-        # ------------------------------------------------
         if "top expense" in q or "highest expense" in q:
             data = get_top_expenses(query)
             if not data:
                 return "No expense data found"
 
             return "\n".join([
-                f"{d.get('date')} | {d.get('description')} | ₹{abs(float(d.get('amount', 0))):,.2f}"
+                f"{d.get('date')} | {d.get('description')} | ₹{abs(_safe_float(d.get('amount'))):,.2f}"
                 for d in data[:10]
             ])
 
-        # ------------------------------------------------
-        # INSIGHTS
-        # ------------------------------------------------
         if "insight" in q or "analysis" in q:
             data = get_financial_insights(query)
 
-            return (
-                f"Total Spend: ₹{data['total_spend']:,.2f}\n"
-                f"Top Category: {data['top_category']}\n\n"
-                f"Top Expenses:\n" +
-                "\n".join([
-                    f"{e.get('description')} - ₹{abs(float(e.get('amount', 0))):,.2f}"
-                    for e in data["top_expenses"]
-                ])
+            top_category = data["top_category"]
+            top_category_text = (
+                f"{top_category[0]} - ₹{top_category[1]:,.2f}"
+                if top_category
+                else "Not available"
             )
 
-        # ------------------------------------------------
-        # DEFAULT → SEARCH TRANSACTIONS
-        # ------------------------------------------------
+            top_expenses_text = "\n".join([
+                f"{e.get('description')} - ₹{abs(_safe_float(e.get('amount'))):,.2f}"
+                for e in data["top_expenses"]
+            ])
+
+            return (
+                f"Total Spend: ₹{data['total_spend']:,.2f}\n"
+                f"Top Category: {top_category_text}\n\n"
+                f"Top Expenses:\n{top_expenses_text}"
+            )
+
         data = search_transactions(query)
 
         if not data:
             return "No transactions found"
 
         return "\n".join([
-            f"{d.get('date')} | {d.get('description')} | {d.get('tran_type')} | ₹{float(d.get('amount', 0)):,.2f}"
+            f"{d.get('date')} | {d.get('description')} | {d.get('tran_type')} | ₹{_safe_float(d.get('amount')):,.2f}"
             for d in data[:10]
         ])
 
